@@ -1,5 +1,5 @@
 {
-  "name": "aiguilleur",
+  "name": "automode",
   "version": "0.1.0",
   "description": "Picks the model and effort level for each prompt, escalates on evidence of failure, measures quota savings; ultracode as a session switch",
   "author": {

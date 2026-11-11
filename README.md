@@ -5,7 +5,7 @@ A Claude Code mod (desktop app and terminal, version 2.1.321 or later) that pick
 ## Install
 
 ```
-/plugin install aiguilleur --marketplace FloGV01/automode
+/plugin install automode --marketplace FloGV01/automode
 ```
 
 Then run `/reload-plugins`.
@@ -28,19 +28,19 @@ Then run `/reload-plugins`.
 
 ## Shadow mode
 
-By default AutoMode starts in **shadow** mode: it decides and logs without applying anything. After 7 days, `/aiguilleur bilan` reports the simulated savings and how choices were spread, so you can decide whether to turn it on.
+By default AutoMode starts in **shadow** mode: it decides and logs without applying anything. After 7 days, `/automode report` reports the simulated savings and how choices were spread, so you can decide whether to turn it on.
 
 ## Commands
 
-`/aiguilleur [actif | ombre | off | auto | ultracode on|off | bilan | statut]`
+`/automode [active | shadow | off | auto | ultracode on|off | report | status]`
 
-(`actif` = active, `ombre` = shadow, `bilan` = report, `statut` = status.)
+Prompt prefixes: `@haiku`, `@sonnet`, `@opus`, `@max`, `@fable`, `@auto`, `effort low|medium|high|very high|max`.
 
-Prompt prefixes: `@haiku`, `@sonnet`, `@opus`, `@max`, `@fable`, `@auto`, `effort bas|moyen|haut|max` (low, medium, high, max).
+Prompts are understood in English and in French.
 
 ## Privacy
 
-The log stays local in `~/.claude/aiguilleur/` and never contains prompt text: only the choice, the reason, token counts and cost.
+The log stays local in `~/.claude/automode/` and never contains prompt text: only the choice, the reason, token counts and cost.
 
 ## License
 

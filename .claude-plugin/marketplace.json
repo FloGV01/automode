@@ -6,7 +6,7 @@
   },
   "plugins": [
     {
-      "name": "aiguilleur",
+      "name": "automode",
       "source": "./",
       "description": "AutoMode: picks the model and effort level for each prompt in Claude Code"
     }

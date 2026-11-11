@@ -1,286 +1,286 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Affichage, ModeAiguilleur } from '../types'
+import type { AutoModeMode, Display } from '../types'
 import {
-  CONSIGNE_JUGE, CRANS, CRAN_SUR, SEUIL_CONFIANCE, QUOTA_TENDU,
-  borne, cout, decider, familleDe, lireCheck, lireCorrection, lireJuge, lireOrdre, lireTransition,
-  libelleDe, monter, plancher, questionJuge, reglesLocales,
-} from './classer'
-import type { Cran, Decision, Famille, Preuve, Tache, Usage, Verdict, Source, Effort } from './classer'
+  JUDGE_PROMPT, TIERS, SAFE_TIER, CONFIDENCE_THRESHOLD, TIGHT_QUOTA,
+  clamp, cost, decide, familyOf, readCheck, readCorrection, readJudge, readOrder, readTransition,
+  labelOf, climb, floorFor, judgeQuestion, localRules,
+} from './classify'
+import type { Tier, Decision, Family, Evidence, Task, Usage, Verdict, Source, Effort } from './classify'
 
-// L’aiguilleur choisit le modèle et l’effort de chaque demande de l’utilisateur.
-//   - prompt.submit classe la demande : ordre explicite, transition courte, correction, règles locales, juge Haiku ;
-//   - turn.step applique le choix à chaque requête de la boucle principale (jamais aux sous-agents) ;
-//   - tool.call repère les tests rouges et fait monter sur preuve ;
-//   - mode ombre les 7 premiers jours : décide et journalise sans appliquer, puis /aiguilleur bilan ;
-//   - la bande au-dessus de la saisie affiche l’état et porte les boutons (mode, ultracode).
-// Le journal reste en local dans ~/.claude/aiguilleur/, sans aucun texte de demande.
+// AutoMode picks the model and the effort for each of the user's prompts.
+//   - prompt.submit classifies the prompt: explicit order, short transition, correction, local rules, Haiku judge;
+//   - turn.step applies the choice to every request of the main loop (never to subagents);
+//   - tool.call spots failing tests and escalates on evidence;
+//   - shadow mode by default: decides and logs without applying, then /automode report after 7 days;
+//   - the band above the input shows the state and carries the buttons (AutoMode, Ultracode).
+// The log stays local in ~/.claude/automode/ and never contains prompt text.
 
-// Dossier du journal, fixé au démarrage à partir du dossier personnel.
-let DOSSIER = ''
-const SEPT_JOURS = 7 * 24 * 3600 * 1000
-const JUGE_DELAI_MS = 2500
-const SAUTS_MAX = 2
-const ALIAS: Record<Famille, string> = { haiku: 'haiku', sonnet: 'sonnet', opus: 'opus', fable: 'fable' }
+// Log folder, set at session start from the home folder.
+let LOG_DIR = ''
+const SEVEN_DAYS = 7 * 24 * 3600 * 1000
+const JUDGE_TIMEOUT_MS = 2500
+const MAX_JUMPS = 2
+const ALIAS: Record<Family, string> = { haiku: 'haiku', sonnet: 'sonnet', opus: 'opus', fable: 'fable' }
 
 type Dollar = EngineInterface
 
-const affichage = atom({ plugin: 'aiguilleur', key: 'affichage' } as const, {
-  mode: 'ombre', libelle: '…', raison: 'en attente de la première demande', verrou: false, ultracode: false, quota: 0, bilanPret: false,
-} as Affichage, { shape: 'aiguilleur-1' })
+const display = atom({ plugin: 'automode', key: 'display' } as const, {
+  mode: 'shadow', label: '…', reason: 'waiting for the first prompt', locked: false, ultracode: false, quota: 0, reportReady: false,
+} as Display, { shape: 'automode-1' })
 
-// ---------------------------------------------------------------- état de session (repart à zéro au rechargement)
+// ---------------------------------------------------------------- session state (reset on reload)
 
-// Numéro affiché dans la bande à côté du nom du modèle.
+// Version number shown in the band next to the model name.
 const VERSIONS: Record<string, string> = { Haiku: '5.5', Sonnet: '5.5', Opus: '5.5', Fable: '5.2' }
 
-let mode: ModeAiguilleur = 'ombre'
-let tache: Tache | null = null
-let decision: Decision | null = null // la décision du tour en cours
-let verrouManuel = false // /model ou /effort tapé par l’utilisateur
-let derniereReponse = ''
-let finDernierTour = 0
-let contexteTokens = 0
+let mode: AutoModeMode = 'shadow'
+let task: Task | null = null
+let decision: Decision | null = null // the decision for the current turn
+let manualLock = false // /model or /effort typed by the user
+let lastAnswer = ''
+let lastTurnEnd = 0
+let contextTokens = 0
 let quotaPct = 0
-let juge: { ms: number; cout: number } | null = null
-let tour: { usage: Usage; reel: number; simule: number; base: number; modeles: string[] } = vide()
-let checks: Record<string, number> = {} // empreinte d’un check rouge → nombre de fois vu rouge après une édition
-let editeDepuisCheck = false
-let preuveEnAttente: Preuve | null = null
-let workflowsVus = 0
-let journal: { jour: string; lignes: string[] } = { jour: '', lignes: [] }
+let judge: { ms: number; cost: number } | null = null
+let turn: { usage: Usage; actual: number; simulated: number; base: number; models: string[] } = empty()
+let checks: Record<string, number> = {} // fingerprint of a failing check → times seen failing after an edit
+let editedSinceCheck = false
+let pendingEvidence: Evidence | null = null
+let workflowsSeen = 0
+let log: { day: string; lines: string[] } = { day: '', lines: [] }
 
-function vide() {
-  return { usage: { entree: 0, sortie: 0, lecture: 0, ecriture: 0 }, reel: 0, simule: 0, base: 0, modeles: [] as string[] }
+function empty() {
+  return { usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, actual: 0, simulated: 0, base: 0, models: [] as string[] }
 }
 
-// ---------------------------------------------------------------- journal
+// ---------------------------------------------------------------- log
 
-async function noter($: Dollar, ligne: Record<string, unknown>): Promise<void> {
-  if (!DOSSIER) return
+async function writeLog($: Dollar, line: Record<string, unknown>): Promise<void> {
+  if (!LOG_DIR) return
   try {
     const t = await $.clock.now()
-    const jour = new Date(t).toISOString().slice(0, 10)
-    const fichier = `${DOSSIER}/journal-${jour}.jsonl`
-    if (journal.jour !== jour) {
-      journal = { jour, lignes: [] }
+    const day = new Date(t).toISOString().slice(0, 10)
+    const file = `${LOG_DIR}/log-${day}.jsonl`
+    if (log.day !== day) {
+      log = { day, lines: [] }
       try {
-        journal.lignes = (await $.fs.read(fichier)).split('\n').filter(Boolean)
+        log.lines = (await $.fs.read(file)).split('\n').filter(Boolean)
       } catch {
-        journal.lignes = []
+        log.lines = []
       }
     }
-    journal.lignes.push(JSON.stringify({ t, ...ligne }))
-    await $.fs.write(fichier, journal.lignes.join('\n') + '\n')
+    log.lines.push(JSON.stringify({ t, ...line }))
+    await $.fs.write(file, log.lines.join('\n') + '\n')
   } catch {
-    // un journal illisible ne doit jamais gêner la session
+    // an unreadable log must never get in the way of the session
   }
 }
 
-async function lireJournaux($: Dollar, jours: number): Promise<Record<string, any>[]> {
-  const maintenant = await $.clock.now()
+async function readLogs($: Dollar, days: number): Promise<Record<string, any>[]> {
+  const now = await $.clock.now()
   const out: Record<string, any>[] = []
-  for (let i = 0; i < jours; i++) {
-    const jour = new Date(maintenant - i * 86_400_000).toISOString().slice(0, 10)
+  for (let i = 0; i < days; i++) {
+    const day = new Date(now - i * 86_400_000).toISOString().slice(0, 10)
     try {
-      for (const l of (await $.fs.read(`${DOSSIER}/journal-${jour}.jsonl`)).split('\n')) {
+      for (const l of (await $.fs.read(`${LOG_DIR}/log-${day}.jsonl`)).split('\n')) {
         if (l) out.push(JSON.parse(l))
       }
     } catch {
-      // jour sans journal
+      // no log that day
     }
   }
   return out
 }
 
-// ---------------------------------------------------------------- affichage
+// ---------------------------------------------------------------- display
 
-async function rafraichir($: Dollar, champs: Partial<Affichage> = {}): Promise<void> {
-  const installeLe = Number((await $.store.get('installeLe')) ?? 0)
-  const maintenant = await $.clock.now()
-  await update($, affichage, a => ({
-    ...a,
+async function refresh($: Dollar, fields: Partial<Display> = {}): Promise<void> {
+  const installedAt = Number((await $.store.get('installedAt')) ?? 0)
+  const now = await $.clock.now()
+  await update($, display, d => ({
+    ...d,
     mode,
-    verrou: verrouManuel || Boolean(tache?.verrou),
+    locked: manualLock || Boolean(task?.locked),
     quota: quotaPct,
-    bilanPret: mode === 'ombre' && installeLe > 0 && maintenant - installeLe >= SEPT_JOURS,
-    ...champs,
+    reportReady: mode === 'shadow' && installedAt > 0 && now - installedAt >= SEVEN_DAYS,
+    ...fields,
   }))
 }
 
-async function changerMode($: Dollar, m: ModeAiguilleur): Promise<string> {
+async function setMode($: Dollar, m: AutoModeMode): Promise<string> {
   mode = m
   await $.store.set('mode', m)
-  await noter($, { ev: 'mode', mode: m })
-  await rafraichir($)
-  return m === 'actif' ? 'AutoMode actif : il applique ses choix.' : m === 'ombre' ? 'AutoMode en ombre : il décide et journalise sans appliquer.' : 'Aiguilleur coupé.'
+  await writeLog($, { ev: 'mode', mode: m })
+  await refresh($)
+  return m === 'active' ? 'AutoMode active: it applies its choices.' : m === 'shadow' ? 'AutoMode in shadow mode: it decides and logs without applying.' : 'AutoMode off.'
 }
 
-async function basculerUltracode($: Dollar, allumer: boolean): Promise<string> {
+async function toggleUltracode($: Dollar, on: boolean): Promise<string> {
   try {
-    const r = await $.command.run({ command: 'effort', args: allumer ? 'ultracode on' : 'ultracode off' })
-    const texte = r.text ?? ''
-    const ok = allumer ? /ultracode on/i.test(texte) : /ultracode off/i.test(texte)
+    const r = await $.command.run({ command: 'effort', args: on ? 'ultracode on' : 'ultracode off' })
+    const text = r.text ?? ''
+    const ok = on ? /ultracode on/i.test(text) : /ultracode off/i.test(text)
     if (ok) {
-      workflowsVus = 0
-      await rafraichir($, { ultracode: allumer })
+      workflowsSeen = 0
+      await refresh($, { ultracode: on })
     }
-    await noter($, { ev: 'ultracode', allumer, ok })
-    return texte || (allumer ? 'Ultracode demandé.' : 'Ultracode coupé.')
+    await writeLog($, { ev: 'ultracode', on, ok })
+    return text || (on ? 'Ultracode requested.' : 'Ultracode off.')
   } catch (err) {
-    return `Ultracode : la commande n’a pas pu partir (${String(err).slice(0, 120)}).`
+    return `Ultracode: the command could not be sent (${String(err).slice(0, 120)}).`
   }
 }
 
-// ---------------------------------------------------------------- classement
+// ---------------------------------------------------------------- classification
 
-async function appelerJuge($: Dollar, texte: string): Promise<Verdict | null> {
-  const debut = await $.clock.now()
+async function callJudge($: Dollar, text: string): Promise<Verdict | null> {
+  const start = await $.clock.now()
   try {
     const r = await $.model.complete({
       model: 'haiku',
-      system: [{ text: CONSIGNE_JUGE, cache: true }],
-      prompt: questionJuge(texte, derniereReponse),
+      system: [{ text: JUDGE_PROMPT, cache: true }],
+      prompt: judgeQuestion(text, lastAnswer),
       maxTokens: 80,
       effort: 'low',
-      timeoutMs: JUGE_DELAI_MS,
+      timeoutMs: JUDGE_TIMEOUT_MS,
     })
     const u = r.usage
-    juge = {
-      ms: (await $.clock.now()) - debut,
-      cout: cout('haiku', { entree: u.input_tokens, sortie: u.output_tokens, lecture: u.cache_read_input_tokens, ecriture: u.cache_creation_input_tokens }),
+    judge = {
+      ms: (await $.clock.now()) - start,
+      cost: cost('haiku', { input: u.input_tokens, output: u.output_tokens, cacheRead: u.cache_read_input_tokens, cacheWrite: u.cache_creation_input_tokens }),
     }
-    return r.isAnswered ? lireJuge(r.text) : null
+    return r.isAnswered ? readJudge(r.text) : null
   } catch {
-    juge = { ms: (await $.clock.now()) - debut, cout: 0 }
+    judge = { ms: (await $.clock.now()) - start, cost: 0 }
     return null
   }
 }
 
-function tacheVers(cran: Cran, maintenant: number, verrou = false, sauts = 0): Tache {
-  return { cran, famille: CRANS[cran].famille, depuis: maintenant, sauts, verrou }
+function taskAt(tier: Tier, now: number, locked = false, jumps = 0): Task {
+  return { tier, family: TIERS[tier].family, since: now, jumps, locked }
 }
 
-async function classer($: Dollar, texte: string): Promise<Decision> {
-  const maintenant = await $.clock.now()
-  const dossier = await $.session.cwd()
-  const ctx = { tache, contexteTokens, inactifMs: finDernierTour ? maintenant - finDernierTour : 0, quotaPct }
-  const p = plancher(texte, dossier)
-  juge = null
+async function classify($: Dollar, text: string): Promise<Decision> {
+  const now = await $.clock.now()
+  const folder = await $.session.cwd()
+  const ctx = { task, contextTokens, idleMs: lastTurnEnd ? now - lastTurnEnd : 0, quotaPct }
+  const f = floorFor(text, folder)
+  judge = null
 
-  // 1. ordre explicite en tête de message
-  const ordre = lireOrdre(texte)
-  if (ordre?.reset) {
-    tache = null
-    verrouManuel = false
+  // 1. explicit order at the start of the message
+  const order = readOrder(text)
+  if (order?.reset) {
+    task = null
+    manualLock = false
   }
-  if (ordre && (ordre.cran !== undefined || ordre.effort)) {
-    const cran = ordre.cran ?? tache?.cran ?? CRAN_SUR
-    if (ordre.cran !== undefined) tache = tacheVers(cran, maintenant, true)
-    return decider({ cran, confiance: 1, raison: 'ordre explicite', nouvelleTache: ordre.cran !== undefined, source: 'ordre', ...(ordre.effort ? { effortForce: ordre.effort } : {}) }, p, ctx)
+  if (order && (order.tier !== undefined || order.effort)) {
+    const tier = order.tier ?? task?.tier ?? SAFE_TIER
+    if (order.tier !== undefined) task = taskAt(tier, now, true)
+    return decide({ tier, confidence: 1, reason: 'explicit order', newTask: order.tier !== undefined, source: 'order', ...(order.effort ? { forcedEffort: order.effort } : {}) }, f, ctx)
   }
 
-  // 2. preuve faible notée au tour précédent : l’effort monte maintenant (il ne pouvait pas monter en cours de tour)
-  if (preuveEnAttente === 'faible' && tache && !tache.verrou) {
-    tache = { ...tache, cran: monter(tache.cran, 'faible') }
+  // 2. weak evidence noted during the previous turn: the effort goes up now (it could not change mid-turn)
+  if (pendingEvidence === 'weak' && task && !task.locked) {
+    task = { ...task, tier: climb(task.tier, 'weak') }
   }
-  preuveEnAttente = null
+  pendingEvidence = null
 
-  // 3. correction de l’utilisateur : preuve forte, on change de modèle
-  const correction = lireCorrection(texte)
-  if (correction === 'correction' && tache && !tache.verrou) {
-    if (tache.sauts < SAUTS_MAX) {
-      const cran = monter(tache.cran, 'forte')
-      tache = { ...tacheVers(cran, maintenant, false, tache.sauts + 1) }
-      return decider({ cran, confiance: 1, raison: 'correction de l’utilisateur : on monte', nouvelleTache: false, source: 'correction' }, p, ctx)
+  // 3. correction from the user: strong evidence, the model changes
+  const correction = readCorrection(text)
+  if (correction === 'correction' && task && !task.locked) {
+    if (task.jumps < MAX_JUMPS) {
+      const tier = climb(task.tier, 'strong')
+      task = { ...taskAt(tier, now, false, task.jumps + 1) }
+      return decide({ tier, confidence: 1, reason: 'user correction: escalating', newTask: false, source: 'correction' }, f, ctx)
     }
-    $.ui.toast('AutoMode : deux montées déjà faites sur cette tâche. Tape @opus, @max ou @fable pour forcer.')
+    $.ui.toast('AutoMode: already escalated twice on this task. Type @opus, @max or @fable to force.')
   }
 
-  // 4. un choix manuel fige la tâche
-  if ((verrouManuel || tache?.verrou) && tache) {
-    return decider({ cran: tache.cran, confiance: 1, raison: 'choix manuel conservé', nouvelleTache: false, source: 'ordre' }, p, ctx)
+  // 4. a manual choice locks the task
+  if ((manualLock || task?.locked) && task) {
+    return decide({ tier: task.tier, confidence: 1, reason: 'manual choice kept', newTask: false, source: 'order' }, f, ctx)
   }
 
-  // 5. transitions courtes
-  const tr = lireTransition(texte)
-  if (tr && tache) {
-    return decider({
-      cran: tache.cran, confiance: 1, raison: tr.raison, nouvelleTache: false, source: 'transition',
-      ...(tr.genre === 'effort' ? { effortForce: tr.effort } : {}),
-    }, p, ctx)
+  // 5. short transitions
+  const tr = readTransition(text)
+  if (tr && task) {
+    return decide({
+      tier: task.tier, confidence: 1, reason: tr.reason, newTask: false, source: 'transition',
+      ...(tr.kind === 'effort' ? { forcedEffort: tr.effort } : {}),
+    }, f, ctx)
   }
 
-  // 6. règles locales, puis juge dans la zone floue (jamais sur des données privées)
-  let v: Verdict & { source: Source } = { ...reglesLocales(texte), source: 'regles' }
-  if (correction === 'contestation' && tache) v = { ...v, cran: borne(Math.max(v.cran, tache.cran)), raison: 'contestation : au moins le cran du travail contesté' }
-  else if (v.confiance < SEUIL_CONFIANCE && !p?.sansJuge) {
-    const j = await appelerJuge($, texte)
-    v = j ? { ...j, cran: borne(Math.max(j.cran, j.confiance < 0.6 ? CRAN_SUR : 0)), source: 'juge' } : { ...v, cran: borne(Math.max(v.cran, CRAN_SUR)), source: 'defaut', raison: 'juge indisponible : défaut sûr' }
+  // 6. local rules, then the judge in the fuzzy zone (never on private data)
+  let v: Verdict & { source: Source } = { ...localRules(text), source: 'rules' }
+  if (correction === 'challenge' && task) v = { ...v, tier: clamp(Math.max(v.tier, task.tier)), reason: 'challenge: at least the tier of the challenged work' }
+  else if (v.confidence < CONFIDENCE_THRESHOLD && !f?.noJudge) {
+    const j = await callJudge($, text)
+    v = j ? { ...j, tier: clamp(Math.max(j.tier, j.confidence < 0.6 ? SAFE_TIER : 0)), source: 'judge' } : { ...v, tier: clamp(Math.max(v.tier, SAFE_TIER)), source: 'default', reason: 'judge unavailable: safe default' }
   }
-  const d = decider(v, p, ctx)
-  if (!tache || d.nouvelleTache || d.cran > tache.cran) tache = { ...tacheVers(d.cran, maintenant), famille: d.famille }
+  const d = decide(v, f, ctx)
+  if (!task || d.newTask || d.tier > task.tier) task = { ...taskAt(d.tier, now), family: d.family }
   return d
 }
 
-// ---------------------------------------------------------------- escalade en cours de tour
+// ---------------------------------------------------------------- escalation during a turn
 
-async function preuve($: Dollar, force: Preuve, raison: string): Promise<void> {
-  if (!tache || tache.verrou || verrouManuel) return
-  if (force === 'faible') {
-    preuveEnAttente = 'faible'
-    await noter($, { ev: 'preuve', force, raison })
+async function evidence($: Dollar, strength: Evidence, reason: string): Promise<void> {
+  if (!task || task.locked || manualLock) return
+  if (strength === 'weak') {
+    pendingEvidence = 'weak'
+    await writeLog($, { ev: 'evidence', strength, reason })
     return
   }
-  if (tache.sauts >= SAUTS_MAX) {
-    $.ui.toast('AutoMode : échecs répétés après deux montées. À toi de décider (@max, @fable ou ultracode).')
+  if (task.jumps >= MAX_JUMPS) {
+    $.ui.toast('AutoMode: repeated failures after two escalations. Your call (@max, @fable or ultracode).')
     return
   }
-  const cran = monter(tache.cran, 'forte')
-  tache = tacheVers(cran, await $.clock.now(), false, tache.sauts + 1)
-  if (decision) decision = { ...decision, cran, famille: CRANS[cran].famille, effort: CRANS[cran].effort, source: 'preuve', raison }
-  await noter($, { ev: 'preuve', force, raison, cran })
-  if (mode === 'actif') $.ui.toast(`AutoMode : ${raison}, passage à ${CRANS[cran].libelle}.`)
-  await rafraichir($, { libelle: CRANS[cran].libelle, raison })
+  const tier = climb(task.tier, 'strong')
+  task = taskAt(tier, await $.clock.now(), false, task.jumps + 1)
+  if (decision) decision = { ...decision, tier, family: TIERS[tier].family, effort: TIERS[tier].effort, source: 'evidence', reason }
+  await writeLog($, { ev: 'evidence', strength, reason, tier })
+  if (mode === 'active') $.ui.toast(`AutoMode: ${reason}, switching to ${TIERS[tier].label}.`)
+  await refresh($, { label: TIERS[tier].label, reason })
 }
 
-// ---------------------------------------------------------------- bilan
+// ---------------------------------------------------------------- report
 
-async function bilan($: Dollar): Promise<string> {
-  const l = await lireJournaux($, 7)
-  const tours = l.filter(x => x.ev === 'tour')
-  if (tours.length === 0) return 'Aucun tour journalisé sur les 7 derniers jours.'
-  const somme = (k: string) => tours.reduce((s, x) => s + (Number(x[k]) || 0), 0)
-  const reel = somme('reel')
-  const simule = somme('simule')
-  const base = somme('base')
-  const parCran: Record<string, number> = {}
-  for (const x of tours) parCran[x.libelle] = (parCran[x.libelle] ?? 0) + 1
-  const juges = l.filter(x => x.ev === 'decision' && x.jugeMs)
-  const latence = juges.length ? Math.round(juges.reduce((s, x) => s + x.jugeMs, 0) / juges.length) : 0
-  const coutJuge = juges.reduce((s, x) => s + (x.jugeCout || 0), 0)
+async function report($: Dollar): Promise<string> {
+  const l = await readLogs($, 7)
+  const turns = l.filter(x => x.ev === 'turn')
+  if (turns.length === 0) return 'No turns logged in the last 7 days.'
+  const sum = (k: string) => turns.reduce((s, x) => s + (Number(x[k]) || 0), 0)
+  const actual = sum('actual')
+  const simulated = sum('simulated')
+  const base = sum('base')
+  const byTier: Record<string, number> = {}
+  for (const x of turns) byTier[x.label] = (byTier[x.label] ?? 0) + 1
+  const judged = l.filter(x => x.ev === 'decision' && x.judgeMs)
+  const latency = judged.length ? Math.round(judged.reduce((s, x) => s + x.judgeMs, 0) / judged.length) : 0
+  const judgeCost = judged.reduce((s, x) => s + (x.judgeCost || 0), 0)
   const corrections = l.filter(x => x.ev === 'decision' && x.source === 'correction').length
-  const manuels = l.filter(x => x.ev === 'manuel').length
-  const preuves = l.filter(x => x.ev === 'preuve').length
+  const manual = l.filter(x => x.ev === 'manual').length
+  const evidences = l.filter(x => x.ev === 'evidence').length
   const sources: Record<string, number> = {}
   for (const x of l.filter(y => y.ev === 'decision')) sources[x.source] = (sources[x.source] ?? 0) + 1
-  const quotas = tours.map(x => x.quota).filter((q: unknown) => typeof q === 'number')
-  const enOmbre = tours.every(x => x.mode !== 'actif')
-  const gain = (a: number, b: number) => (b > 0 ? Math.round((1 - a / b) * 100) : 0)
-  const lignes = [
-    `Bilan de l’aiguilleur sur 7 jours (${tours.length} tours, ${enOmbre ? 'mode ombre' : 'mode actif'}) :`,
-    enOmbre
-      ? `- Coût réel (sans aiguilleur) : ${reel.toFixed(2)} $ ; coût simulé avec ses choix : ${simule.toFixed(2)} $, soit ${gain(simule, reel)} % d’économie estimée.`
-      : `- Coût réel avec l’aiguilleur : ${reel.toFixed(2)} $ ; sans lui (modèle de session) : ${base.toFixed(2)} $, soit ${gain(reel, base)} % d’économie.`,
-    `- Répartition : ${Object.entries(parCran).map(([k, n]) => `${k} ${Math.round((n / tours.length) * 100)} %`).join(', ')}.`,
-    `- Décisions : ${Object.entries(sources).map(([k, n]) => `${k} ${n}`).join(', ')}.`,
-    `- Juge Haiku : ${juges.length} appels, ${latence} ms en moyenne, ${coutJuge.toFixed(3)} $ au total.`,
-    `- Signaux de sous-classement : ${corrections} corrections, ${manuels} choix manuels (/model, /effort), ${preuves} preuves d’échec.`,
-    quotas.length ? `- Quota : de ${quotas[0]} % à ${quotas[quotas.length - 1]} % sur la période (plus haut des fenêtres 5 h et 7 j).` : '- Quota : pas de lecture disponible.',
-    'Prix catalogue en $ ; en abonnement, l’ordre de grandeur se reporte sur le quota. Le coût simulé suppose les mêmes volumes de tokens.',
+  const quotas = turns.map(x => x.quota).filter((q: unknown) => typeof q === 'number')
+  const inShadow = turns.every(x => x.mode !== 'active')
+  const saving = (a: number, b: number) => (b > 0 ? Math.round((1 - a / b) * 100) : 0)
+  const lines = [
+    `AutoMode report over 7 days (${turns.length} turns, ${inShadow ? 'shadow mode' : 'active mode'}):`,
+    inShadow
+      ? `- Actual cost (without AutoMode): $${actual.toFixed(2)}; simulated cost with its choices: $${simulated.toFixed(2)}, i.e. ${saving(simulated, actual)}% estimated savings.`
+      : `- Actual cost with AutoMode: $${actual.toFixed(2)}; without it (session model): $${base.toFixed(2)}, i.e. ${saving(actual, base)}% savings.`,
+    `- Split: ${Object.entries(byTier).map(([k, n]) => `${k} ${Math.round((n / turns.length) * 100)}%`).join(', ')}.`,
+    `- Decisions: ${Object.entries(sources).map(([k, n]) => `${k} ${n}`).join(', ')}.`,
+    `- Haiku judge: ${judged.length} calls, ${latency} ms on average, $${judgeCost.toFixed(3)} in total.`,
+    `- Under-routing signals: ${corrections} corrections, ${manual} manual choices (/model, /effort), ${evidences} pieces of failure evidence.`,
+    quotas.length ? `- Quota: from ${quotas[0]}% to ${quotas[quotas.length - 1]}% over the period (highest of the 5-hour and 7-day windows).` : '- Quota: no reading available.',
+    'List prices in $; on a subscription, the order of magnitude carries over to your quota. The simulated cost assumes the same token volumes.',
   ]
-  return lignes.join('\n')
+  return lines.join('\n')
 }
 
 // ---------------------------------------------------------------- hooks
@@ -288,51 +288,51 @@ async function bilan($: Dollar): Promise<string> {
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const r = await next(e)
-    const maison = await $.env.get('HOME')
-    DOSSIER = maison ? `${maison}/.claude/aiguilleur` : ''
+    const home = await $.env.get('HOME')
+    LOG_DIR = home ? `${home}/.claude/automode` : ''
     await $.command.register({
-      name: 'aiguilleur',
-      description: 'AutoMode de modèle et d’effort : état, mode (actif, ombre, off), ultracode, bilan',
-      argumentHint: '[actif | ombre | off | auto | ultracode on|off | bilan]',
+      name: 'automode',
+      description: 'AutoMode model and effort routing: status, mode (active, shadow, off), ultracode, report',
+      argumentHint: '[active | shadow | off | auto | ultracode on|off | report | status]',
     })
-    const stocke = (await $.store.get('mode')) as ModeAiguilleur | undefined
-    mode = stocke === 'actif' || stocke === 'off' ? stocke : 'ombre'
-    if (!(await $.store.get('installeLe'))) await $.store.set('installeLe', await $.clock.now())
-    await rafraichir($)
+    const stored = (await $.store.get('mode')) as AutoModeMode | undefined
+    mode = stored === 'active' || stored === 'off' ? stored : 'shadow'
+    if (!(await $.store.get('installedAt'))) await $.store.set('installedAt', await $.clock.now())
+    await refresh($)
     return r
   })
 
   on('prompt.submit', async ($, e, next) => {
     if (mode === 'off' || e.command || e.isMeta || e.text.trim().startsWith('/')) return next(e)
-    const d = await classer($, e.text)
+    const d = await classify($, e.text)
     decision = d
-    await noter($, {
-      ev: 'decision', mode, cran: d.cran, famille: d.famille, effort: d.effort, source: d.source,
-      raison: d.raison, plancher: d.plancher, nouvelle: d.nouvelleTache, quota: quotaPct, contexte: contexteTokens,
-      ...(juge ? { jugeMs: juge.ms, jugeCout: juge.cout } : {}),
+    await writeLog($, {
+      ev: 'decision', mode, tier: d.tier, family: d.family, effort: d.effort, source: d.source,
+      reason: d.reason, floor: d.floor, new: d.newTask, quota: quotaPct, context: contextTokens,
+      ...(judge ? { judgeMs: judge.ms, judgeCost: judge.cost } : {}),
     })
-    await rafraichir($, { libelle: libelleDe(d.famille, d.effort), raison: d.plancher ? `${d.raison} · ${d.plancher}` : d.raison })
+    await refresh($, { label: labelOf(d.family, d.effort), reason: d.floor ? `${d.reason} · ${d.floor}` : d.reason })
     return next(e)
   }).catch(($, e, next) => next(e))
 
   on('turn.step', async function* ($, e, next) {
     if (e.agentId !== undefined || mode === 'off' || !decision) return yield* next(e)
-    const sessionFamille = familleDe(e.model) ?? 'opus'
-    const appliquer = mode === 'actif' && !verrouManuel
-    const envoye = appliquer
-      ? { ...e, model: ALIAS[decision.famille], ...(e.effort !== undefined ? { effort: decision.effort as Effort } : {}) }
+    const sessionFamily = familyOf(e.model) ?? 'opus'
+    const apply = mode === 'active' && !manualLock
+    const sent = apply
+      ? { ...e, model: ALIAS[decision.family], ...(e.effort !== undefined ? { effort: decision.effort as Effort } : {}) }
       : e
-    const res = yield* next(envoye)
+    const res = yield* next(sent)
     const u = res?.usage
     if (u) {
-      const usage: Usage = { entree: u.input_tokens, sortie: u.output_tokens, lecture: u.cache_read_input_tokens, ecriture: u.cache_creation_input_tokens }
-      const repondu = familleDe(u.model) ?? sessionFamille
-      for (const k of ['entree', 'sortie', 'lecture', 'ecriture'] as const) tour.usage[k] += usage[k]
-      tour.reel += cout(repondu, usage)
-      tour.simule += cout(decision.famille, usage)
-      tour.base += cout(sessionFamille, usage)
-      if (!tour.modeles.includes(u.model)) tour.modeles.push(u.model)
-      contexteTokens = usage.entree + usage.lecture + usage.ecriture + usage.sortie
+      const usage: Usage = { input: u.input_tokens, output: u.output_tokens, cacheRead: u.cache_read_input_tokens, cacheWrite: u.cache_creation_input_tokens }
+      const answered = familyOf(u.model) ?? sessionFamily
+      for (const k of ['input', 'output', 'cacheRead', 'cacheWrite'] as const) turn.usage[k] += usage[k]
+      turn.actual += cost(answered, usage)
+      turn.simulated += cost(decision.family, usage)
+      turn.base += cost(sessionFamily, usage)
+      if (!turn.models.includes(u.model)) turn.models.push(u.model)
+      contextTokens = usage.input + usage.cacheRead + usage.cacheWrite + usage.output
     }
     return res
   })
@@ -340,59 +340,59 @@ export const register: Register = on => {
   on('tool.call', async ($, e, next) => {
     const res = await next(e)
     if (e.agentId !== undefined || mode === 'off') return res
-    const nom = String(e.tool)
-    if (nom === 'Edit' || nom === 'Write' || nom === 'NotebookEdit') editeDepuisCheck = true
-    if (nom === 'Workflow' && (await read($, affichage)).ultracode) {
-      workflowsVus += 1
-      if (workflowsVus === 1) $.ui.toast('AutoMode : premier workflow ultracode de la session, il peut lancer des dizaines d’agents.')
-      if (quotaPct >= QUOTA_TENDU) $.ui.toast(`AutoMode : quota à ${quotaPct} %, pense à couper ultracode.`)
+    const name = String(e.tool)
+    if (name === 'Edit' || name === 'Write' || name === 'NotebookEdit') editedSinceCheck = true
+    if (name === 'Workflow' && (await read($, display)).ultracode) {
+      workflowsSeen += 1
+      if (workflowsSeen === 1) $.ui.toast('AutoMode: first ultracode workflow of the session, it can launch dozens of agents.')
+      if (quotaPct >= TIGHT_QUOTA) $.ui.toast(`AutoMode: quota at ${quotaPct}%, consider turning ultracode off.`)
     }
-    if (nom === 'Bash') {
-      const commande = String((e as { command?: unknown }).command ?? '')
+    if (name === 'Bash') {
+      const command = String((e as { command?: unknown }).command ?? '')
       const r = res as { result?: { stdout?: string; stderr?: string }; isError?: boolean; text?: string }
-      const sortie = `${r.result?.stdout ?? ''}\n${r.result?.stderr ?? ''}\n${r.text ?? ''}`.slice(-20_000)
-      const c = lireCheck(commande, sortie, r.isError === true)
-      if (c.check && c.rouge && editeDepuisCheck) {
-        checks[c.empreinte] = (checks[c.empreinte] ?? 0) + 1
-        const n = checks[c.empreinte]
-        if (n === 2) await preuve($, 'faible', 'même test rouge deux fois après correction')
-        if (n === 3) await preuve($, 'forte', 'test toujours rouge après montée')
+      const output = `${r.result?.stdout ?? ''}\n${r.result?.stderr ?? ''}\n${r.text ?? ''}`.slice(-20_000)
+      const c = readCheck(command, output, r.isError === true)
+      if (c.check && c.red && editedSinceCheck) {
+        checks[c.fingerprint] = (checks[c.fingerprint] ?? 0) + 1
+        const n = checks[c.fingerprint]
+        if (n === 2) await evidence($, 'weak', 'same test failed twice after a fix')
+        if (n === 3) await evidence($, 'strong', 'test still failing after escalation')
       }
-      if (c.check && !c.rouge) checks = {}
-      if (c.check) editeDepuisCheck = false
+      if (c.check && !c.red) checks = {}
+      if (c.check) editedSinceCheck = false
     }
     return res
   }).catch(($, e, next) => next(e))
 
   on('turn.complete', async ($, e, next) => {
-    const fini = await next(e)
-    if (e.agentId !== undefined) return fini
-    finDernierTour = await $.clock.now()
-    derniereReponse = String((fini as { text?: string })?.text ?? '').slice(0, 600)
-    if (decision && tour.usage.entree + tour.usage.lecture + tour.usage.sortie > 0) {
-      await noter($, {
-        ev: 'tour', mode, libelle: libelleDe(decision.famille, decision.effort), famille: decision.famille, effort: decision.effort,
-        source: decision.source, modeles: tour.modeles, ...tour.usage,
-        reel: Number(tour.reel.toFixed(5)), simule: Number(tour.simule.toFixed(5)), base: Number(tour.base.toFixed(5)), quota: quotaPct,
+    const done = await next(e)
+    if (e.agentId !== undefined) return done
+    lastTurnEnd = await $.clock.now()
+    lastAnswer = String((done as { text?: string })?.text ?? '').slice(0, 600)
+    if (decision && turn.usage.input + turn.usage.cacheRead + turn.usage.output > 0) {
+      await writeLog($, {
+        ev: 'turn', mode, label: labelOf(decision.family, decision.effort), family: decision.family, effort: decision.effort,
+        source: decision.source, models: turn.models, ...turn.usage,
+        actual: Number(turn.actual.toFixed(5)), simulated: Number(turn.simulated.toFixed(5)), base: Number(turn.base.toFixed(5)), quota: quotaPct,
       })
     }
-    tour = vide()
-    await rafraichir($)
-    return fini
+    turn = empty()
+    await refresh($)
+    return done
   })
 
   on('session.measure', async ($, e, next) => {
     const pcts = e.rateLimits.map(r => r.percentUsed).filter(n => typeof n === 'number')
     if (pcts.length) quotaPct = Math.max(...pcts)
-    if (e.changed.includes('rateLimits')) await rafraichir($)
+    if (e.changed.includes('rateLimits')) await refresh($)
     return next(e)
   })
 
   on('classic.PostModelSwitch', async ($, e, next) => {
     if (e.source === 'command' || e.source === 'picker') {
-      verrouManuel = true
-      await noter($, { ev: 'manuel', quoi: 'model', vers: familleDe(e.to_model) })
-      await rafraichir($, { raison: 'modèle choisi à la main : /aiguilleur auto pour rendre la main' })
+      manualLock = true
+      await writeLog($, { ev: 'manual', what: 'model', to: familyOf(e.to_model) })
+      await refresh($, { reason: 'model picked by hand: /automode auto to hand control back' })
     }
     return next(e)
   }).catch(($, e, next) => next(e))
@@ -400,78 +400,78 @@ export const register: Register = on => {
   on('command.run', { command: 'effort' }, async ($, e, next) => {
     const r = await next(e)
     if (e.origin.kind !== 'plugin' && !/ultracode/i.test(e.args) && e.args.trim()) {
-      verrouManuel = true
-      await noter($, { ev: 'manuel', quoi: 'effort' })
-      await rafraichir($, { raison: 'effort choisi à la main : /aiguilleur auto pour rendre la main' })
+      manualLock = true
+      await writeLog($, { ev: 'manual', what: 'effort' })
+      await refresh($, { reason: 'effort picked by hand: /automode auto to hand control back' })
     }
-    if (/ultracode/i.test(e.args)) await rafraichir($, { ultracode: /ultracode on/i.test(r.text ?? '') })
+    if (/ultracode/i.test(e.args)) await refresh($, { ultracode: /ultracode on/i.test(r.text ?? '') })
     return r
   }).catch(($, e, next) => next(e))
 
-  on('command.run', { command: 'aiguilleur' }, async ($, e) => {
+  on('command.run', { command: 'automode' }, async ($, e) => {
     const a = e.args.trim().toLowerCase()
-    if (a === 'actif' || a === 'on') return { text: await changerMode($, 'actif') }
-    if (a === 'ombre') return { text: await changerMode($, 'ombre') }
-    if (a === 'off') return { text: await changerMode($, 'off') }
+    if (a === 'active' || a === 'on') return { text: await setMode($, 'active') }
+    if (a === 'shadow') return { text: await setMode($, 'shadow') }
+    if (a === 'off') return { text: await setMode($, 'off') }
     if (a === 'auto') {
-      verrouManuel = false
-      if (tache) tache = { ...tache, verrou: false }
-      await rafraichir($, { raison: 'routage automatique rétabli' })
-      return { text: 'AutoMode : routage automatique rétabli.' }
+      manualLock = false
+      if (task) task = { ...task, locked: false }
+      await refresh($, { reason: 'automatic routing restored' })
+      return { text: 'AutoMode: automatic routing restored.' }
     }
-    if (a === 'ultracode on') return { text: await basculerUltracode($, true) }
-    if (a === 'ultracode off') return { text: await basculerUltracode($, false) }
-    if (a === 'bilan') return { text: await bilan($) }
-    if (a && a !== 'statut') return { text: 'Usage : /aiguilleur [actif | ombre | off | auto | ultracode on | ultracode off | bilan]' }
-    const s = await read($, affichage)
+    if (a === 'ultracode on') return { text: await toggleUltracode($, true) }
+    if (a === 'ultracode off') return { text: await toggleUltracode($, false) }
+    if (a === 'report') return { text: await report($) }
+    if (a && a !== 'status') return { text: 'Usage: /automode [active | shadow | off | auto | ultracode on | ultracode off | report | status]' }
+    const s = await read($, display)
     return {
-      text: `AutoMode ${s.mode} · ${s.libelle} · ${s.raison}${s.verrou ? ' · choix manuel figé' : ''}${s.ultracode ? ' · ultracode allumé' : ''} · quota ${s.quota} %`,
+      text: `AutoMode ${s.mode} · ${s.label} · ${s.reason}${s.locked ? ' · manual choice locked' : ''}${s.ultracode ? ' · ultracode on' : ''} · quota ${s.quota}%`,
     }
   })
 
-  // Une seule ligne : l’état à gauche (un seul Text, pour éviter les décalages), les boutons à droite.
+  // One row: AutoMode and the chosen model on the left, Ultracode on the right.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    const s = await read($, affichage)
+    const s = await read($, display)
     if (e.props.hasSurvey) return next(e)
     const { Box, Button, Text } = $.ui.resolve(e)
-    const dessous = await next(e)
-    const actif = s.mode === 'actif'
-    const coupe = s.mode === 'off'
-    // Le nom porte la couleur (le bouton natif du bureau ne colore pas son texte) ; le bouton à côté agit.
-    // AutoMode : vert actif, orange ombre, rouge coupé. Ultracode : vert allumé, gris éteint.
-    const boutonMode = (
+    const below = await next(e)
+    const active = s.mode === 'active'
+    const off = s.mode === 'off'
+    // The name carries the color (the desktop's native button does not color its text); the button next to it acts.
+    // AutoMode: green active, orange shadow, red off. Ultracode: green on, grey off.
+    const modeControl = (
       <Box flexDirection="row" alignItems="center" columnGap={1}>
-        <Text bold color={actif ? 'success' : coupe ? 'error' : 'warning'}>AutoMode</Text>
-        <Button key="mode" label={actif ? 'On' : 'Off'} onPress={async () => void (await changerMode($, actif ? 'off' : 'actif'))} />
+        <Text bold color={active ? 'success' : off ? 'error' : 'warning'}>AutoMode</Text>
+        <Button key="mode" label={active ? 'On' : 'Off'} onPress={async () => void (await setMode($, active ? 'off' : 'active'))} />
       </Box>
     )
-    const boutonUltra = (
+    const ultraControl = (
       <Box flexDirection="row" alignItems="center" columnGap={1}>
         {s.ultracode ? <Text bold color="success">Ultracode</Text> : <Text dimColor>Ultracode</Text>}
-        <Button key="ultra" label={s.ultracode ? 'On' : 'Off'} onPress={async () => void $.ui.toast(await basculerUltracode($, !s.ultracode))} />
+        <Button key="ultra" label={s.ultracode ? 'On' : 'Off'} onPress={async () => void $.ui.toast(await toggleUltracode($, !s.ultracode))} />
       </Box>
     )
-    const [nomModele = '', effortTxt = ''] = s.libelle.split(' · ')
-    const modele = VERSIONS[nomModele] ? `${nomModele} ${VERSIONS[nomModele]}` : nomModele
+    const [modelName = '', effortText = ''] = s.label.split(' · ')
+    const model = VERSIONS[modelName] ? `${modelName} ${VERSIONS[modelName]}` : modelName
     return (
       <Box flexDirection="column">
         <Box flexDirection="row" alignItems="center" justifyContent="space-between" columnGap={2}>
           <Box flexDirection="row" alignItems="center" columnGap={2}>
-            {boutonMode}
-            {coupe ? null : (
+            {modeControl}
+            {off ? null : (
               <Box flexDirection="row" alignItems="center" columnGap={1}>
-                <Text>{modele}</Text>
-                {effortTxt ? <Text dimColor>{effortTxt}</Text> : null}
+                <Text>{model}</Text>
+                {effortText ? <Text dimColor>{effortText}</Text> : null}
               </Box>
             )}
-            {!coupe && s.verrou ? <Text dimColor>Manuel</Text> : null}
+            {!off && s.locked ? <Text dimColor>Manual</Text> : null}
           </Box>
           <Box flexDirection="row" alignItems="center" columnGap={2}>
-            {s.bilanPret ? <Button key="bilan" variant="primary" label="Bilan prêt" onPress={async () => void $.ui.toast('Tape /aiguilleur bilan pour le lire.')} /> : null}
-            {boutonUltra}
+            {s.reportReady ? <Button key="report" variant="primary" label="Report ready" onPress={async () => void $.ui.toast('Type /automode report to read it.')} /> : null}
+            {ultraControl}
           </Box>
         </Box>
-        {dessous}
+        {below}
       </Box>
     )
   })

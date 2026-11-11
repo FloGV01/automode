@@ -1,18 +1,18 @@
-export type ModeAiguilleur = 'ombre' | 'actif' | 'off'
+export type AutoModeMode = 'shadow' | 'active' | 'off'
 
-// Ce que la bande au-dessus de la saisie affiche.
-export type Affichage = {
-  mode: ModeAiguilleur
-  libelle: string // « Opus · haut »
-  raison: string
-  verrou: boolean // un choix manuel (/model, @opus…) fige le routage
+// What the band above the input shows.
+export type Display = {
+  mode: AutoModeMode
+  label: string // "Opus · high"
+  reason: string
+  locked: boolean // a manual choice (/model, @opus…) locks the routing
   ultracode: boolean
-  quota: number // le plus haut des quotas 5 h et 7 j, en %
-  bilanPret: boolean // les 7 jours d’ombre sont écoulés
+  quota: number // highest of the 5-hour and 7-day quotas, in %
+  reportReady: boolean // the 7 days of shadow mode are over
 }
 
 declare module 'claude-code' {
   interface PluginState {
-    aiguilleur: { affichage: Shaped<Affichage> }
+    automode: { display: Shaped<Display> }
   }
 }
