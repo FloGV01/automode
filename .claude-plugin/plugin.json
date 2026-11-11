@@ -1,0 +1,1 @@
+{ "name": "aiguilleur", "version": "0.1.0", "description": "Choisit le modèle et l’effort de chaque demande, monte sur preuve d’échec, mesure l’économie de quota ; ultracode en interrupteur de session", "author": { "name": "Florent Guillemin" }, "license": "MIT", "types": "./types/index.d.ts" }

@@ -1,0 +1,14 @@
+{
+  "name": "automode",
+  "description": "AutoMode : choix automatique du modèle et de l’effort dans Claude Code",
+  "owner": {
+    "name": "FloGV01"
+  },
+  "plugins": [
+    {
+      "name": "aiguilleur",
+      "source": "./",
+      "description": "AutoMode : choisit le modèle et l’effort de chaque demande dans Claude Code"
+    }
+  ]
+}
