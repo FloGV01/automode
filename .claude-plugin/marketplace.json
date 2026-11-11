@@ -1,6 +1,6 @@
 {
   "name": "automode",
-  "description": "AutoMode : choix automatique du modèle et de l’effort dans Claude Code",
+  "description": "AutoMode: automatic model and effort selection for Claude Code",
   "owner": {
     "name": "FloGV01"
   },
@@ -8,7 +8,7 @@
     {
       "name": "aiguilleur",
       "source": "./",
-      "description": "AutoMode : choisit le modèle et l’effort de chaque demande dans Claude Code"
+      "description": "AutoMode: picks the model and effort level for each prompt in Claude Code"
     }
   ]
 }

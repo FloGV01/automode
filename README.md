@@ -1,45 +1,47 @@
 # AutoMode
 
-Mod Claude Code (application de bureau et terminal, version 2.1.321 ou plus récente) qui choisit **le modèle et l'effort** de chaque demande, pour être plus performant sur les tâches difficiles et économiser le quota sur les simples.
+A Claude Code mod (desktop app and terminal, version 2.1.321 or later) that picks **the model and the effort level** for each prompt: stronger on hard tasks, lighter on your quota for simple ones.
 
-## Installation
+## Install
 
 ```
 /plugin install aiguilleur --marketplace FloGV01/automode
 ```
 
-Puis `/reload-plugins`.
+Then run `/reload-plugins`.
 
-## Ce qu'il fait
+## What it does
 
-- Classe chaque demande sur six crans : Haiku bas, Sonnet moyen, Sonnet haut, Opus haut, Opus max, puis Fable seulement sur preuve d'échec ou sur demande (`@fable`).
-- Règles locales d'abord ; un juge Haiku rapide tranche les cas flous ; défaut sûr Sonnet haut s'il ne répond pas.
-- Monte tout seul sur preuve d'échec : tests rouges répétés ou correction de l'utilisateur.
-- Protège le cache : pas de changement de modèle en pleine tâche quand le contexte est chaud.
-- Planchers de risque : données privées, modèle financier, secret, migration, revue demandée.
-- Ne touche jamais aux sous-agents.
+- Sorts each prompt into six tiers: Haiku low, Sonnet medium, Sonnet high, Opus high, Opus max, then Fable only on evidence of failure or on request (`@fable`).
+- Local rules first; a fast Haiku judge settles unclear cases; falls back to a safe default (Sonnet high) if the judge does not answer.
+- Escalates on its own when there is evidence of failure: repeated failing tests or a correction from the user.
+- Protects the prompt cache: no model switch in the middle of a task while the context is warm.
+- Risk floors: private data, financial models, secrets, migrations, requested reviews.
+- Never touches subagents.
 
-## La bande au-dessus de la saisie
+## The band above the input
 
-`AutoMode [On|Off]   Sonnet 5.5 moyen   Ultracode [On|Off]`
+`AutoMode [On|Off]   Sonnet 5.5 medium   Ultracode [On|Off]`
 
-- **AutoMode** en vert : actif. En orange : mode ombre. En rouge : coupé.
-- **Ultracode** en vert : allumé. En gris : éteint.
+- **AutoMode** in green: active. In orange: shadow mode. In red: off.
+- **Ultracode** in green: on. In grey: off.
 
-## Mode ombre
+## Shadow mode
 
-Par défaut, AutoMode démarre en **ombre** : il décide et journalise sans rien appliquer. Au bout de 7 jours, `/aiguilleur bilan` donne l'économie simulée et la répartition des choix, pour décider de l'activer.
+By default AutoMode starts in **shadow** mode: it decides and logs without applying anything. After 7 days, `/aiguilleur bilan` reports the simulated savings and how choices were spread, so you can decide whether to turn it on.
 
-## Commandes
+## Commands
 
 `/aiguilleur [actif | ombre | off | auto | ultracode on|off | bilan | statut]`
 
-Ordres en tête de message : `@haiku`, `@sonnet`, `@opus`, `@max`, `@fable`, `@auto`, `effort bas|moyen|haut|max`.
+(`actif` = active, `ombre` = shadow, `bilan` = report, `statut` = status.)
 
-## Vie privée
+Prompt prefixes: `@haiku`, `@sonnet`, `@opus`, `@max`, `@fable`, `@auto`, `effort bas|moyen|haut|max` (low, medium, high, max).
 
-Le journal reste en local dans `~/.claude/aiguilleur/`, sans aucun texte de demande : seulement le choix, la raison, les volumes de tokens et le coût.
+## Privacy
 
-## Licence
+The log stays local in `~/.claude/aiguilleur/` and never contains prompt text: only the choice, the reason, token counts and cost.
+
+## License
 
 MIT
